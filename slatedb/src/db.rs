@@ -49,13 +49,13 @@ use crate::bytes_range::{ByteRangeBounds, BytesRange};
 use crate::cached_object_store::CachedObjectStore;
 use crate::clock::MonotonicClock;
 use crate::config::{
-    CloseOptions, FlushOptions, FlushType, MergeOptions, PutOptions, ReadOptions, ScanOptions,
-    Settings, WriteOptions,
+    CloseOptions, FlushOptions, FlushType, ManifestRefresh, MergeOptions, PutOptions, ReadOptions,
+    ScanOptions, Settings, WriteOptions,
 };
 use crate::db_common::extract_segment_prefix;
 use crate::db_iter::{DbIterator, DbRecencyIterator};
 use crate::db_snapshot::DbSnapshot;
-use crate::db_state::{collect_touched_segments, DbState, SsTableHandle, SsTableId};
+use crate::db_state::{collect_touched_segments, DbState, DbStateView, SsTableHandle, SsTableId};
 use crate::db_stats::DbStats;
 use crate::error::SlateDBError;
 use crate::manifest::{Manifest, VersionedManifest};
@@ -73,8 +73,10 @@ use crate::types::KeyValue;
 use crate::utils::{format_bytes_si, SafeSender, WatchableOnceCellReader};
 use crate::wal_replay::{WalReplayIterator, WalReplayOptions};
 use crate::{DbCacheManagerOps, DbMetadataOps, DbReadOps, DbWriteOps};
+use chrono::{DateTime, Utc};
 use slatedb_common::clock::SystemClock;
 use slatedb_common::metrics::MetricsRecorderHelper;
+use slatedb_common::single_flight::SingleFlight;
 use slatedb_common::DbRand;
 use slatedb_txn_obj::DirtyObject;
 
@@ -84,6 +86,9 @@ pub use builder::DbBuilder;
 pub use builder::DbReaderBuilder;
 
 pub(crate) mod builder;
+
+#[cfg(test)]
+mod manifest_refresh_tests;
 
 pub(crate) struct DbInner {
     pub(crate) state: Arc<RwLock<DbState>>,
@@ -120,6 +125,11 @@ pub(crate) struct DbInner {
     /// L0 SSTs. When `None`, the database is the singleton `prefix=""`
     /// segment encoded in the manifest's top-level tree.
     pub(crate) segment_extractor: Option<Arc<dyn PrefixExtractor>>,
+    /// The start time of the last successful manifest refresh. The writer's manifest is at
+    /// least as new as the remote manifest at this time.
+    last_manifest_refresh: parking_lot::Mutex<DateTime<Utc>>,
+    /// Lets concurrent reads share one on-demand manifest refresh. See [`Self::read_view`].
+    manifest_refresh_flight: SingleFlight<(), ()>,
 }
 
 impl DbInner {
@@ -177,6 +187,9 @@ impl DbInner {
         let snapshot_manager = Arc::new(SnapshotManager::new(oracle.clone(), rand.clone()));
         let wal_observer = DbWalObserver::new(wal_observer, oracle.clone(), status_manager.clone());
 
+        // The writer loaded the latest manifest while it opened.
+        let last_manifest_refresh = parking_lot::Mutex::new(system_clock.now());
+
         let db_inner = Self {
             state,
             settings,
@@ -198,8 +211,42 @@ impl DbInner {
             snapshot_manager,
             status_manager,
             segment_extractor,
+            last_manifest_refresh,
+            manifest_refresh_flight: SingleFlight::new(),
         };
         Ok(db_inner)
+    }
+
+    /// Records a successful manifest refresh that started at `started`.
+    pub(crate) fn record_manifest_refresh(&self, started: DateTime<Utc>) {
+        let mut last = self.last_manifest_refresh.lock();
+        *last = (*last).max(started);
+    }
+
+    /// Returns true if the last manifest refresh is older than the poll interval.
+    fn manifest_is_stale(&self) -> bool {
+        let Ok(interval) = chrono::Duration::from_std(self.settings.manifest_poll_interval) else {
+            // The interval is too large to represent, so the manifest never becomes stale.
+            return false;
+        };
+        let last = *self.last_manifest_refresh.lock();
+        self.system_clock.now().signed_duration_since(last) >= interval
+    }
+
+    /// Returns the state view for a read.
+    ///
+    /// With [`ManifestRefresh::OnDemand`], this first refreshes the manifest if the last
+    /// refresh is older than [`Settings::manifest_poll_interval`]. GC can delete SSTs that an
+    /// old manifest references, so every read must use a recent manifest.
+    pub(crate) async fn read_view(&self) -> Result<DbStateView, SlateDBError> {
+        self.check_closed()?;
+        if self.settings.manifest_refresh == ManifestRefresh::OnDemand && self.manifest_is_stale() {
+            // A read that finds a refresh in progress waits for that refresh.
+            self.manifest_refresh_flight
+                .call((), || self.memtable_flusher.refresh_manifest())
+                .await?;
+        }
+        Ok(self.state.read().view())
     }
 
     /// Get the value for a given key.
@@ -219,8 +266,7 @@ impl DbInner {
         key: K,
         options: &ReadOptions,
     ) -> Result<Option<KeyValue>, SlateDBError> {
-        self.check_closed()?;
-        let db_state = self.state.read().view();
+        let db_state = self.read_view().await?;
         self.reader
             .get_key_value_with_options(key, options, &db_state, None, None)
             .await
@@ -235,8 +281,7 @@ impl DbInner {
         options: &ScanOptions,
         prefix: Option<Bytes>,
     ) -> Result<DbIterator, SlateDBError> {
-        self.check_closed()?;
-        let db_state = self.state.read().view();
+        let db_state = self.read_view().await?;
         self.reader
             .scan_with_options(
                 range,
@@ -256,8 +301,7 @@ impl DbInner {
         prefix: Bytes,
         options: &ScanOptions,
     ) -> Result<DbRecencyIterator, SlateDBError> {
-        self.check_closed()?;
-        let db_state = self.state.read().view();
+        let db_state = self.read_view().await?;
         self.reader
             .scan_prefix_by_recency_with_options(prefix, options, &db_state)
             .await
@@ -8287,6 +8331,7 @@ mod tests {
             #[cfg(feature = "wal_disable")]
             wal_enabled: true,
             manifest_poll_interval: Duration::from_millis(100),
+            manifest_refresh: ManifestRefresh::Interval,
             manifest_update_timeout: Duration::from_secs(300),
             max_unflushed_bytes: 134_217_728,
             l0_max_ssts: 8,

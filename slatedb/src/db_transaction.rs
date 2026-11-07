@@ -154,7 +154,7 @@ impl DbTransaction {
             self.txn_manager.track_read_keys(&self.txn_id, read_keys);
         }
 
-        let db_state = self.db_inner.state.read().view();
+        let db_state = self.db_inner.read_view().await?;
 
         // Build the write batch iterator synchronously while holding the read
         // guard, avoiding a clone of the full batch. The iterator materializes
@@ -301,8 +301,7 @@ impl DbTransaction {
             self.range_trackers.lock().push(tracker);
         }
 
-        self.db_inner.check_closed()?;
-        let db_state = self.db_inner.state.read().view();
+        let db_state = self.db_inner.read_view().await?;
 
         // Build the write batch iterator synchronously while holding the read
         // guard, avoiding a clone of the full batch. The iterator materializes
@@ -2231,6 +2230,7 @@ mod tests {
             #[cfg(feature = "wal_disable")]
             wal_enabled: true,
             manifest_poll_interval: std::time::Duration::from_secs(3600),
+            manifest_refresh: crate::config::ManifestRefresh::Interval,
             manifest_update_timeout: std::time::Duration::from_secs(300),
             max_unflushed_bytes: 134_217_728,
             l0_max_ssts: 8,

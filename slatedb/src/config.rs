@@ -253,6 +253,27 @@ impl SstBlockSize {
     }
 }
 
+/// When a writer refreshes its manifest.
+///
+/// A refresh loads the latest manifest. It shows newly compacted data and detects a newer
+/// writer. After a compaction replaces SSTs, a checkpoint protects the replaced SSTs only for
+/// [`CompactorOptions::checkpoint_lifetime`]. A read that uses an older manifest can then fail.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub enum ManifestRefresh {
+    /// The writer refreshes its manifest every [`Settings::manifest_poll_interval`].
+    #[default]
+    Interval,
+
+    /// The writer does not refresh its manifest on a timer. Before a read starts, the writer
+    /// refreshes the manifest if the last refresh is older than
+    /// [`Settings::manifest_poll_interval`]. Concurrent reads share one refresh.
+    ///
+    /// An idle database makes no manifest requests. The first read after an idle period
+    /// waits for one refresh. A fenced writer detects the newer writer on its next read or
+    /// manifest write.
+    OnDemand,
+}
+
 /// Describes the durability of data based on the medium (e.g. in-memory, object storags)
 /// that the data is currently stored in. Currently this is used to define a
 /// durability filter for data served by a read.
@@ -732,9 +753,16 @@ pub struct Settings {
 
     /// How frequently to poll for new manifest files. Refreshing the manifest file
     /// allows the db to detect fencing operations and newly compacted data.
+    ///
+    /// With [`ManifestRefresh::OnDemand`], this is the maximum age of the manifest that
+    /// a read can use. See [`Self::manifest_refresh`].
     #[serde(deserialize_with = "deserialize_duration")]
     #[serde(serialize_with = "serialize_duration")]
     pub manifest_poll_interval: Duration,
+
+    /// When the writer refreshes its manifest. Defaults to [`ManifestRefresh::Interval`].
+    #[serde(default)]
+    pub manifest_refresh: ManifestRefresh,
 
     /// The maximum amount of time to wait for a manifest update before giving up.
     #[serde(deserialize_with = "deserialize_duration")]
@@ -886,6 +914,7 @@ impl std::fmt::Debug for Settings {
             data.field("wal_enabled", &self.wal_enabled);
         }
         data.field("manifest_poll_interval", &self.manifest_poll_interval)
+            .field("manifest_refresh", &self.manifest_refresh)
             .field("manifest_update_timeout", &self.manifest_update_timeout)
             .field("min_filter_keys", &self.min_filter_keys)
             .field("max_unflushed_bytes", &self.max_unflushed_bytes)
@@ -1123,6 +1152,7 @@ impl Default for Settings {
             #[cfg(feature = "wal_disable")]
             wal_enabled: true,
             manifest_poll_interval: Duration::from_secs(1),
+            manifest_refresh: ManifestRefresh::Interval,
             manifest_update_timeout: Duration::from_secs(300),
             min_filter_keys: 1000,
             max_unflushed_bytes: 1_073_741_824,
@@ -2020,6 +2050,21 @@ mod tests {
             .remove("enable_experimental_incremental_compaction");
         let omitted: CompactorOptions = serde_json::from_value(value).unwrap();
         assert!(!omitted.enable_experimental_incremental_compaction);
+    }
+
+    #[test]
+    fn test_manifest_refresh_config() {
+        let mut value = serde_json::to_value(Settings::default()).unwrap();
+        assert_eq!(value["manifest_refresh"], "Interval");
+
+        // Settings files from earlier versions do not have the field.
+        value.as_object_mut().unwrap().remove("manifest_refresh");
+        let omitted: Settings = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(omitted.manifest_refresh, ManifestRefresh::Interval);
+
+        value["manifest_refresh"] = "OnDemand".into();
+        let on_demand: Settings = serde_json::from_value(value).unwrap();
+        assert_eq!(on_demand.manifest_refresh, ManifestRefresh::OnDemand);
     }
 
     #[test]

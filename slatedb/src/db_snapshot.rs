@@ -78,8 +78,7 @@ impl DbSnapshot {
         key: K,
         options: &ReadOptions,
     ) -> Result<Option<KeyValue>, crate::Error> {
-        self.db_inner.check_closed()?;
-        let db_state = self.db_inner.state.read().view();
+        let db_state = self.db_inner.read_view().await?;
         let kv = self
             .db_inner
             .reader
@@ -186,8 +185,7 @@ impl DbSnapshot {
         options: &ScanOptions,
         prefix: Option<Bytes>,
     ) -> Result<DbIterator, crate::Error> {
-        self.db_inner.check_closed()?;
-        let db_state = self.db_inner.state.read().view();
+        let db_state = self.db_inner.read_view().await?;
         self.db_inner
             .reader
             .scan_with_options(

@@ -19,7 +19,7 @@ use super::uploader::UploadedMemtable;
 use crate::checkpoint::{
     CheckpointCreateResult, CheckpointLifecycle, CheckpointRequest, CheckpointResult,
 };
-use crate::config::CheckpointOptions;
+use crate::config::{CheckpointOptions, ManifestRefresh};
 use crate::db::DbInner;
 use crate::db_state::{collect_touched_segments, DbState, SsTableId, SsTableView};
 use crate::dispatcher::MessageHandler;
@@ -258,6 +258,10 @@ struct ManifestWriterHandler {
 #[async_trait]
 impl MessageHandler<ManifestWriterCommand> for ManifestWriterHandler {
     fn tickers(&mut self) -> Vec<crate::dispatcher::MessageTickerDef<ManifestWriterCommand>> {
+        // In on-demand mode, reads request refreshes. See `DbInner::read_view`.
+        if self.db.settings.manifest_refresh == ManifestRefresh::OnDemand {
+            return Vec::new();
+        }
         vec![crate::dispatcher::MessageTickerDef::new(
             self.manifest_poll_interval,
             Box::new(|| ManifestWriterCommand::PollManifest { done: None }),
@@ -882,10 +886,13 @@ impl ManifestWriterHandler {
         &mut self,
         done: Option<oneshot::Sender<Result<(), SlateDBError>>>,
     ) -> Result<(), SlateDBError> {
+        // The refreshed manifest is at least as new as the remote manifest at this time.
+        let started = self.db.system_clock.now();
         let result = async {
             self.manifest.refresh().await?;
             let remote_dirty = self.manifest.prepare_dirty()?;
             self.merge_remote_manifest(remote_dirty);
+            self.db.record_manifest_refresh(started);
             let _ = self.tracker_tx.send(TrackerMessage::ManifestRefreshed);
             Ok(())
         }
